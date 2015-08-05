@@ -1,0 +1,581 @@
+// Script for Acapella 2.6 (PerkinElmer) and higher
+// Analyzes ciliation levels in RPE cells based on a centrosomal (pericentrin) and ciliary (acetylated tubulin) stainings
+//expected input are folders with tiff files exported by softWoRx (GE Healthcare)
+// t01..tN are N fields to be analyzed
+
+GetPath()
+ChDir(path)
+MkDir("Segmentation")
+MkDir("Cropped")
+Set(SegmentationDir=path&"/Segmentation/", Cropped_Dir=path&"/Cropped/")
+
+//Input parameters section		
+	input(CilChan, "523", "Choose Wavelength for pericentrin channel", "s", "Channels. Allowed values: \"523\",\"676\".", 3)
+	Input(CilArea, 8, "Minimum cilia area", "i")
+	Input(CilRefRatio, 1.5, type="d", prompt="Cilium to reference intensity ratio", description="Normally between 1.3 and 2")
+	Input(SearchRegion, 10, "Cilia search region", "i", description="Circular region to search for cilia in pericentrosomal region")
+	Input(CenterRadius,4,"Centering radius","i",description="Circular region to check for center position of the cilium")
+	Input(SegmentOutput,0,type="y",prompt="Output segmentation")
+	Input(MeasureCentrosomeNucleusDistance, 0, type="y", prompt="Measure distances between nuclei and centrosomes")
+//End input parameters section	
+
+//Output of parameter values into a text file
+	PrintfOpen("parameters.txt")
+	Printf("Pericentrin channel\t	%s\n",CilChan)
+	Printf("Minimum cilia area(pixels)\t %d\n",CilArea)
+	Printf("Cilia/Cell body contrast\t%1.1f\n",CilRefRatio)
+	Printf("Cilia search subregion(pixels)\t%d\n",SearchRegion)
+	Printf("Cilia center radius(pixels)\t%d\n",CenterRadius)
+//End Output of parameter values into a text file
+
+//Preparation of the output text files
+PathSplit(path | setname=basename)
+printfopen(path&"/"&setname&"_ouput.txt")
+printf("Sample\tCell Number\tCilia number\tCiliation\tAverage cilia length\tStDev of cilia length\tAvg Acetylated Intensity\tStDev Acetylated Intensity\n")
+printfopen(path&"/"&setname&"_Cilia_stat_ouput.txt")
+printf("Sample\tCilia No\tCilia length\tIntensity\tContrast\tRoundness\n")
+//End preparation of the output text files
+
+//Create a circular mask to limit putative cilia detection in cropped regions
+	Blank(1, 1, 255|centerspot=image)
+	Blank((SearchRegion+5)*2,(SearchRegion+5)*2|RectMaskImage=image)
+	Blank((SearchRegion+17)*2,(SearchRegion+17)*2|ExpandedRectMaskImage=image)
+	Paste(centerspot, SearchRegion+5, SearchRegion+5, image=RectMaskImage)
+	Circles(CenterRadius)
+	Mask2Stencil(image, Neighbourhood=8)
+	Stencil2Objects(Neighbourhood=8)
+	FillObjects()
+	Set(CircularMask=objects.body.mask.image)
+	Paste(image, 12, 12, image=ExpandedRectMaskImage)
+	Mask2Stencil(image, Neighbourhood=8)
+	Stencil2Objects(Neighbourhood=8)
+	FillObjects()
+	Set(ExpandedCircularMask=objects.body.mask.image)
+	Delete(objects)
+//End create a circular mask to limit putative cilia detection in cropped regions
+
+// listing directory content
+Glob(Path & "/*_t01.tif", ignorecase=yes)
+If(files.length>0)
+	Set(samples_names=files)
+Else()
+	Warning("No files named accroding to 't01'")
+	Stop()
+End()
+
+Set(Start_Time=__time__)
+set(Start_Time_Sec=substr(Start_Time,1,2)*3600+substr(Start_Time,4,2)*60+substr(Start_Time,7,2))
+
+Foreach(0..samples_names.length-1)
+
+	Set(Curr_Sample=substr(samples_names[i],1,at("_t01.tif",samples_names[i],1)-1))
+	Glob(Curr_Sample&"*")
+
+// listing subdirectory content and processing the files
+	Set(CentrosomeOverNucleus=0,CentrosomeNextToNucleus=0)
+	If(files.length>0)
+		set(cent=0, cilia_count=0)
+
+// start analyzing the images within a folder			
+		Foreach(0..files.length-1, "k")
+
+		///reading images
+			printfopen()
+			Printf("Analysis of set %i. Image %i out of %i\n" ,i, k+1,files.length)
+
+			PathSplit(files[k]|wellname=propername)
+			ReadImage(files[i], "tif", image_index=-1)
+			Set(Z_No=sourcedata.@rowcount/3)
+
+			MaxProjection(sourcedata, Z_No, 0)
+			set(PCNT=MaxP)
+
+			MaxProjection(sourcedata, Z_No, 5)
+			set(cilia_im=MaxP, Tub_Z_stack=Z_stack)
+			AntiMedian(image=cilia_im, edge=5|am_cilia=image)
+			
+			If(AnalyzeActin)
+				set(ActinFile=iif(CilChan==523,rep(files[k],"w"&CilChan,"w676"),rep(files[k],"w"&CilChan,"w523")))
+				MaxProjection(Z_No, ActinFile)
+				set(actin_im=MaxP, Actin_Z_stack=Z_stack)
+			End()
+
+			Blank(cilia_im.width,cilia_im.Height|Cilia_masks=image)
+
+// Defining cell borders
+			Cluster(500, PCNT.median, PCNT)
+			FillObjects()
+			CalcIntensity(Image=PCNT, CalcStdDev=yes)
+			Set(cell_borders=objects)
+// end defining cell borders
+
+// find centrsomes
+			Spot_Detection_b(PCNT, "body", yes, WholeCells=objects, ShowOutputParameters=no)
+			ObjectFilter(IntegratedSpotSignal_BackgroundSubtracted/Area>1, objects=spots)
+			Mask2Stencil(objects.body.mask)
+			Stencil2objects()
+			RemoveBorderObjects(20)
+			Set(centrosomes=objects)
+			set(cent=cent+centrosomes.count)
+			If(centrosomes.count==0)
+				continue()
+			End()
+// end find centrsomes
+
+// create cilia search region and search for cilia
+			CalcErosion(-SearchRegion)
+			set(objects.body=objects.eroded)
+			CalcBorder(body)
+			ImageView(objects.border, "centroRegions", gamma=2, image=PCNT)
+			CalcBoundingBox()
+
+// check if all bounding boxes are properly sized (SearchRegion+5)*2
+			Foreach(0..objects.count-1, "box_count")
+// check for X
+				If(abs(Objects[box_count].bounding_x2-Objects[box_count].bounding_x1)!=((SearchRegion+5)*2))
+					Set(Box_difference=((SearchRegion+5)*2)-(Objects[box_count].bounding_x2-Objects[box_count].bounding_x1))
+					If((Objects[box_count].bounding_x2+Box_difference)<(cilia_im.width-1))
+						Set(Objects.bounding_x2[box_count]=(Objects.bounding_x2[box_count]+Box_difference))
+					Else()
+						Set(Objects.bounding_x1[box_count]=(Objects.bounding_x1[box_count]-Box_difference))
+					End()
+				End()
+// check for Y
+				If(abs(Objects[box_count].bounding_Y2-Objects[box_count].bounding_Y1)!=((SearchRegion+5)*2))
+					Set(Box_difference=((SearchRegion+5)*2)-(Objects[box_count].bounding_Y2-Objects[box_count].bounding_Y1))
+					If((Objects[box_count].bounding_Y2+Box_difference)<(cilia_im.width-1))
+						Set(Objects.bounding_Y2[box_count]=(Objects.bounding_Y2[box_count]+Box_difference))
+					Else()
+						Set(Objects.bounding_Y1[box_count]=(Objects.bounding_Y1[box_count]-Box_difference))
+					End()
+				End()
+			End()
+// end check if all bounding boxes are properly sized
+
+			DefineAttr("CiliaOK", 0)
+			DefineAttr("ObjectNo", "objectindex")
+			DefineAttr("ActinIntensity", "objectindex*0")
+			set(AllCentroRegions=objects)
+			Delete(objects)
+			Foreach(0..AllCentroRegions.count-1,"IndCentrosome")
+				set(steps=0)
+				findcroppedfocus(AllCentroRegions.bounding_x1[IndCentrosome], AllCentroRegions.bounding_y1[IndCentrosome], AllCentroRegions.bounding_x2[IndCentrosome], AllCentroRegions.bounding_y2[IndCentrosome], Tub_Z_stack)
+				set(orig_cilia=FocalPlaneimage,cilia_Z_plane=focalZplane)
+				AntiMedian(image=orig_cilia, edge=5|am_cilia_crop=image)
+				
+// thresholding based on an image median intensity and checking 3 brightest intensity values
+				And(CircularMask, image=am_cilia_crop)
+				Sort(image, yes)			//sorting image intensities
+				Uniq(result)		
+				Foreach(0..2, "Int_value")
+					If(result[Int_value]>orig_cilia.median*1.5)     ///GlobalThresh
+						Cluster(CilArea,result[Int_value],am_cilia_crop)
+						And(CircularMask, image=objects.body.mask.image)
+						If(image.max>0)
+							Set(curr_thresh=result[Int_value])
+							Break("0..2, "Int_value"")
+						Else()
+							Delete(objects)
+						End()
+					Else()
+						If(defined("objects")==1)
+							Delete(objects)
+						end()
+					End()
+				End()
+// End thresholding based on an image median intensity and checking 3 brightest intensity values
+
+				If(defined("objects")==0)
+					Push(array_segmented, cilia_8)
+					Convert(1, image=orig_cilia)
+					set(image.factor=1|cilia_8=image)
+					Push(array_cilia, orig_cilia)
+					Push(array_cilia_am, am_cilia_crop)
+					Crop(AllCentroRegions.bounding_x1[IndCentrosome], AllCentroRegions.bounding_y1[IndCentrosome], AllCentroRegions.bounding_x2[IndCentrosome], AllCentroRegions.bounding_y2[IndCentrosome], image=PCNT)
+					Push(array_centrosome, image)
+					Convert(1)
+					set(image.factor=1|cent_8=image)
+					RgbJoin(cilia_8, cent_8)
+					Push(array_overlay, image)							
+					Continue("0..AllCentroRegions.count-1,"IndCentrosome"")
+				End()
+
+// enlarging mask for cilia that were not detected completely due to a high threshold
+				If(objects.count>0)
+					CalcIntensity(Image=am_cilia_crop, Total=yes, AutoRecalc=no)
+					ObjectFilter(intensity==objects.intensity.max)
+					ExtendObject(objects, curr_thresh, am_cilia_crop, GlobalThresh=orig_cilia.median*1.5, CenterCircularMask=CircularMask)
+// if detected cilium is touching the edge of the image expand the search region
+					if(expand_region==1)
+						Crop(AllCentroRegions.bounding_x1[IndCentrosome]-12, AllCentroRegions.bounding_y1[IndCentrosome]-12, AllCentroRegions.bounding_x2[IndCentrosome]+12, AllCentroRegions.bounding_y2[IndCentrosome]+12, image=Tub_Z_stack[focalZplane]|expanded_cilia_image=image)
+						AntiMedian(image=expanded_cilia_image, edge=5|am_expanded_cilia_image=image)
+						cluster(newcilarea,NewThreshold,am_expanded_cilia_image)
+// eliminate all non-center objects
+						if(objects.count>1)
+							DefineAttr("center", "0")
+							foreach(0..objects.count-1,"IndCilium")
+								And(ExpandedCircularMask, image=objects[IndCilium].body.image)
+								set(objects.center[IndCilium]=iif(image.max>0,1,0))
+							end()
+							objectfilter(center==1)
+						end()
+// end eliminate all non-center objects								
+						if(objects.count>1)
+							calcintensity(Image=am_expanded_cilia_image, Total=yes, AutoRecalc=no)
+							ObjectFilter(intensity==objects.intensity.max)
+						end()
+						set(first_expand=1)
+						extendobject(objects, NewThreshold, am_expanded_cilia_image, GlobalThresh=orig_cilia.median*1.5, CenterCircularMask=ExpandedCircularMask)
+					Else()
+						set(first_expand=0, am_expanded_cilia_image=am_cilia_crop,expanded_cilia_image=orig_cilia)
+					end()
+							// end if detected cilium is touching the edge of the image expand the search region							
+				End()
+// end enlarging mask for cilia that wer not detected completely due to a high threshold
+
+				CalcRatioIntensity(objects, iif(first_expand==0,am_cilia_crop,am_expanded_cilia_image), CilRefRatio)
+				CalcAttr( "Roundness" )
+				DefineAttr("NormalizedRoundness", "iif(roundness>0.8,iif(area>15,1,0),0)")
+				ObjectFilter(area<50)
+				If(objects.count>0)
+					CalcIntensity(Image=iif(first_expand==0,orig_cilia,expanded_cilia_image))
+
+					CalcWidthLength()
+					Set(AllCentroRegions.CiliaOK[IndCentrosome]=1)
+
+					if(first_expand==0)			////Image was not expanded for search
+						Convert(1, image=orig_cilia)
+						set(image.factor=1|cilia_8=image)
+						Push(array_cilia, orig_cilia)
+						Push(array_cilia_am, am_cilia_crop)
+						Crop(AllCentroRegions.bounding_x1[IndCentrosome], AllCentroRegions.bounding_y1[IndCentrosome], AllCentroRegions.bounding_x2[IndCentrosome], AllCentroRegions.bounding_y2[IndCentrosome], image=PCNT)
+						Push(array_centrosome, image)
+						Convert(1)
+						set(image.factor=1|cent_8=image)
+						RgbJoin(cilia_8, cent_8)
+						Push(array_overlay, image)
+						CarryObjects(objects.outerzone, "red", image=cilia_8|overlay_image=image)
+						Push(array_segmented, overlay_image)
+					else()					////Image was expanded for search and needs resized images
+						Convert(1, image=expanded_cilia_image)
+						set(image.factor=1|cilia_8=image)
+						Push(array_cilia, expanded_cilia_image)
+						Push(array_cilia_am, am_expanded_cilia_image)
+						Crop(AllCentroRegions.bounding_x1[IndCentrosome]-12, AllCentroRegions.bounding_y1[IndCentrosome]-12, AllCentroRegions.bounding_x2[IndCentrosome]+12, AllCentroRegions.bounding_y2[IndCentrosome]+12, image=PCNT)
+						Push(array_centrosome, image)
+						Convert(1)
+						set(image.factor=1|cent_8=image)
+						RgbJoin(cilia_8, cent_8)
+						Push(array_overlay, image)
+						CarryObjects(objects.outerzone, "red", image=cilia_8|overlay_image=image)
+						Push(array_segmented, overlay_image)
+					end()
+
+// output statistics for cilium features
+					printfopen(path&"/"&setname&"_Cilia_stat_ouput.txt",yes)
+					printf("%s\t%d\t%2.2f\t%2.1f\t%1.2f\t%.2f\n",WellName,Indcentrosome,ceil(objects[0].full_length*objects[0].half_width)*0.32,objects[0].intensity,objects[0].RatInt,objects[0].Roundness)			
+					Push(array_cilia_length,ceil(objects[0].full_length*objects[0].half_width)*0.32)
+					Push(array_cilia_Int,objects[0].intensity)
+// end output statistics for cilium features
+
+				End()
+				If(objects.count==0)
+					Convert(1, image=orig_cilia)
+					set(image.factor=1|cilia_8=image)
+					Push(array_cilia, orig_cilia)
+					Push(array_cilia_am, am_cilia_crop)
+					Crop(AllCentroRegions.bounding_x1[IndCentrosome], AllCentroRegions.bounding_y1[IndCentrosome], AllCentroRegions.bounding_x2[IndCentrosome], AllCentroRegions.bounding_y2[IndCentrosome], image=PCNT)
+					Push(array_centrosome, image)
+					Convert(1)
+					set(image.factor=1|cent_8=image)
+					RgbJoin(cilia_8, cent_8)
+					Push(array_overlay, image)
+					Set(overlay_image=cilia_8)
+					converttorgb(overlay_image|overlay_image=image)	
+					Push(array_segmented, overlay_image)
+				End()
+				set(first_expand=0)
+			End()
+
+			ObjectFilter(CiliaOK==1, objects=AllCentroRegions)
+			CalcErosion(-1, border, objects=objects)
+			Set(cilia_count=cilia_count+objects.count)
+			Set(ciliated_cells=objects)
+			ImageView(objects.border, image=cilia_im, label="ciliated cells")
+// creating a panel of array images and saving into png
+			Blank(array_cilia[0].width*5, array_cilia[0].height)
+			converttorgb(|segment_out_blank=image)
+			PathSplit(files[k]|file_out=propername)
+			foreach(0..array_cilia.length-1,"cilium_index")
+				converttorgb(array_cilia[cilium_index])
+				Paste(image, image=segment_out_blank|segment_out=image)
+				converttorgb(array_cilia_am[cilium_index])	
+				Paste(image, array_cilia[0].width, image=segment_out|segment_out=image)
+				converttorgb(array_centrosome[cilium_index])	
+				Paste(image, array_cilia[0].width*2, image=segment_out|segment_out=image)
+				Paste(array_overlay[cilium_index], array_cilia[0].width*3, image=segment_out|segment_out=image)	
+				Paste(array_segmented[cilium_index], array_cilia[0].width*4, image=segment_out|segment_out=image)	
+				writeimage(SegmentationDir&file_out&"_"&cilium_index&".png", image=segment_out, imageformat="png")
+				WriteImage(Cropped_Dir&file_out&"_"&cilium_index&".tif", image=array_cilia[cilium_index], imageformat="tiff")
+			End()
+			Delete(array_cilia_am, array_cilia, array_centrosome, array_overlay, array_segmented)
+// end creating a panel of array images and saving into png
+
+// output segmentation					
+			If (SegmentOutput) 
+				Convert(1, image=cilia_im)
+				set(image.factor=1|cilia_im_8=image)		
+				set(Detected_Centrosomes=AllCentroRegions.border.mask.image, Detected_Cilia=ciliated_cells.border_eroded.mask.image)
+				
+				Convelems(Detected_Centrosomes, clipoutofrange=yes, size=1, sign="autodetect")
+				set(result=result*255)
+				Paste(result, image=cilia_im_8, method="max")
+				set(Detected_Centrosomes=image)
+
+				Convelems(Detected_Cilia, clipoutofrange=yes, size=1, sign="autodetect")
+				set(result=result*255)
+				Paste(result, image=cilia_im_8, method="max")
+				set(Detected_Cilia=image)
+
+				RgbJoin(Detected_Centrosomes, Detected_Cilia, cilia_im_8, method="fillrangeall")
+				WriteImage(SegmentationDir&wellname&"_cropped.png", imageformat="png")
+			end()
+// end output segmentation					
+
+		End()
+// output statistics for cilia counting
+		printfopen(path&"/"&setname&"_ouput.txt", yes)
+		If(AnalyzeActin)
+			printf("%s\t%d\t%d\t%2.1f\t%2.1f\t%2.2f\t%d\t%.1f\t%d\t%.1f\t%d\t%.1f\n",WellName,cent,cilia_count,cilia_count/cent*100,array_cilia_length.mean,array_cilia_length.stddev,array_cilia_Int.mean,array_cilia_Int.stddev,Actin_non_ciliated.mean,Actin_non_ciliated.stddev,Actin_ciliated.mean,Actin_ciliated.stddev)
+		Else()
+			printf("%s\t%d\t%d\t%2.1f\t%2.1f\t%2.2f\t%d\t%4.1f\n",WellName,cent,cilia_count,cilia_count/cent*100,array_cilia_length.mean,array_cilia_length.stddev,array_cilia_Int.mean,array_cilia_Int.stddev,)
+		End()
+		
+		Delete(array_cilia_Int,array_cilia_length,Actin_non_ciliated,Actin_ciliated,wholecells,cytoregions)
+// end output statistics for cilia counting
+
+// time calculation
+		If(defined("Current_Time_old"))
+			Set(Current_Time=__time__)
+			set(Current_Time_Sec=substr(Current_Time,1,2)*3600+substr(Current_Time,4,2)*60+substr(Current_Time,7,2), Current_Time_old_sec=substr(Current_Time_old,1,2)*3600+substr(Current_Time_old,4,2)*60+substr(Current_Time_old,7,2))
+			Set(CurrSetDuration=(Current_Time_Sec-Current_Time_old_sec)/60, TotalDuration=(Current_Time_Sec-Start_Time_Sec)/60)
+			push(Duration_array,CurrSetDuration)
+			Set(EstimatedLeft=Duration_array.mean*(files.length-(i+1)))
+			set(Current_Time_old=Current_Time)
+		Else()
+			Set(Current_Time=__time__, Current_Time_old=__time__)
+			set(Current_Time_Sec=substr(Current_Time,1,2)*3600+substr(Current_Time,4,2)*60+substr(Current_Time,7,2))
+			Set(CurrSetDuration=(Current_Time_Sec-Start_Time_Sec)/60, TotalDuration=(Current_Time_Sec-Start_Time_Sec)/60)
+			Set(EstimatedLeft=CurrSetDuration*(files.length-1))
+			push(Duration_array,CurrSetDuration)
+		End()
+		PrintfOpen()
+		Printf("Time per well %.1f min. Total duration is %.1f min\n Estimated left %.1f min\n",CurrSetDuration,TotalDuration, EstimatedLeft)
+	End()
+	
+	
+End()
+
+
+Proc OpenObjects (integer NumberOfCycles in "Number of open cycles", objectlist TargetObjects in "Original Objects List", objectlist OpenObjects out "Output")
+{
+	Foreach(1..NumberOfCycles)
+
+		DefineAttr("Open", "body", objects=TargetObjects)
+		CalcErosion(-1, Open, objects=Objects)
+		Set(objects.open=objects.open_eroded)
+		DeleteAttr("open_eroded", objects=objects)
+		CalcErosion(1, Open, objects=Objects)
+		Set(objects.open=objects.open_eroded)
+		DeleteAttr("open_eroded", objects=objects)
+
+	End()
+
+	Set(OpenObjects=objects)
+	Delete("objects")
+}
+// Generation of Max projection and array with z-stacks
+Proc MaxProjection(vector sourcedata in "array with images", integer Z_number in "Number of z-stacks", integer first_file_index in "Index of first Z plane", image MaxP out "Max projection image", vector Z_stack out "Resulting Z-stack")
+
+// By default proc uses sourcedata as an array with images
+{
+	set(image=sourcedata.SourceImage[first_file_index])
+	Convert(2)
+	Push(Z_stack,image)
+	Set(MaxP=image)
+	Foreach(first_file_index+1..first_file_index+Z_number-1, "z")
+		set(image=sourcedata.SourceImage[z])
+		Convert(2)
+		Push(Z_stack,image)
+		paste(MaxP, image=image, method="max"|MaxP=image)
+	End()
+}
+
+Proc FindCroppedFocus(integer x1 in "X1", integer y1 in "Y1", integer x2 in "X2", integer y2 in "Y2", vector Z_stack in "image stack", image FocalPlaneImage out "Focal Plane Image", integer focalZplane out "Z of a focal plane")
+{
+	Foreach(0..Z_stack.length-1)
+		Crop(x1, y1, x2, y2, image=Z_stack[i])
+		Push(stack_max,image.max)
+	End()
+	Foreach(0..Z_stack.length-1)
+		If(stack_max[i]==stack_max.max)
+			Crop(x1, y1, x2, y2, image=Z_stack[i]|FocalPlaneImage=image)
+			Set(focalZplane=i)
+			Break()
+		End()
+	End()
+
+}
+Proc CalcRatioIntensity(objectlist InputObjects in "Input object list", image RefImage in "Image to calculate intensities", double RatIntThresh in "Ratio threshold", objectlist InitialObjects out "Processed object list", objectlist Objects out "Filetered object list")
+// Calculates ratio of the intensities at the border of the objects to 1-pixel-eroded borders. Allows to eliminate 
+{
+		CalcErosion(-1, objects=inputobjects)
+		CalcBorder(eroded)
+		CalcIntensity(eroded_border, RefImage)
+		CalcIntensity(border, RefImage)
+		DefineAttr("RatInt", border_intensity/Eroded_border_intensity)
+		Set(InitialObjects=objects)
+		ObjectFilter(RatInt>RatIntThresh)
+}
+
+Proc ConvertToRGB(image image in "Input 8-bit or 16-bit image", image image out "Ioutput RGB image")
+{
+	Convert(1, image=image)
+	set(image.factor=1)
+	RgbJoin(image, image, image)
+}
+
+Proc CheckCenter(image CenterCircularMask in "Center Mask", objectlist objects in "Input object list", objectlist objects out "Filtered object list", objectlist InputObjects out "Original object list")
+{
+set(InputObjects=objects)
+defineAttr("CenterPos", 0)
+If(objects.count>0)
+	foreach(0..objects.count-1)
+		And(CenterCircularMask, image=objects[i].body.image)
+		If(image.max>0)
+			set(objects.CenterPos[i]=1)
+		end()
+	end()
+	objectfilter(CenterPos==1,objects=Objects)
+End()
+}
+
+Proc ExtendObject(objectlist Objects in "Input object list", double SegmentationThreshold in "current threshold", image image in "Reference image", integer CilArea in "Minimum cilia area (pixels)", double GlobalThresh in "frame threshold (median*1.5)", image CenterCircularMask in "Center Mask", objectlist objects out "resulting object list", integer NewThreshold out "New threshold",integer Steps out "number of steps", integer expand_region out "Search region need to be expanded",integer newcilarea out "detected cilia area")
+{
+		Set(stop_dilation=0, NewThreshold=SegmentationThreshold,steps=0, orig_image=image)
+
+
+		Blank(image.width+2, image.height+2|blank_image=image)
+		Convert(2, image=blank_image|blank_image=image)
+		Paste(CenterCircularMask, 1, 1, image=blank_image|CenterCircularMask_large=image)
+		Paste(image, 1, 1, image=blank_image)
+		cluster(0, 1, image|frame_objects=objects)
+		Set(frame=frame_objects.border.mask.image)
+		Cluster(CilArea, NewThreshold, image)
+		CheckCenter(CenterCircularMask_large, objects)
+		CalcIntensity(Image=image, objects=objects, Total=yes)
+		ObjectFilter(intensity==objects.intensity.max)
+
+		While(stop_dilation==0)
+			set(steps=steps+1)
+			If(steps>30)
+				Break()				
+			End()
+
+			CalcErosion(-1, objects=objects)
+			CalcBorder(eroded, objects=objects)
+			And(objects.eroded_border.mask.image, image=image|border_image=image)
+
+			If(defined("old_border_image"))
+				Minus(border_image, old_border_image)
+				If(result.max==0)
+					Break()
+				End()
+			End()
+			Set(Int_Check=(border_image.max-image.median)/(NewThreshold-image.median))
+			If((Int_Check>0.9)&&(NewThreshold>GlobalThresh))
+				Set(expand=1)
+			Else()
+				If((border_image.max/image.median>5)&&(NewThreshold>GlobalThresh))
+					Set(expand=1)
+				Else()
+					Set(expand=0)
+				End()
+			End()
+
+			If(expand)	//
+				If(NewThreshold<border_image.max)
+					Break()
+				End()
+				Set(NewThreshold=border_image.max,old_border_image=border_image)
+				Cluster(CilArea, NewThreshold, image)
+				CheckCenter(CenterCircularMask_large, objects)
+				CalcIntensity(Image=image, objects=objects, Total=yes)
+				ObjectFilter(intensity==objects.intensity.max)
+			
+			Else()
+				Set(stop_dilation=1)
+			End()
+			
+		End()
+		
+		and(objects.border.mask.image,image=frame|overlap=image)
+		Cluster(CilArea, NewThreshold, orig_image)
+		CheckCenter(CenterCircularMask, objects)
+		set(expand_region=iif(overlap.max>0,1,0),newcilarea=iif(objects.count!=0,objects[0].area,CilArea))
+
+
+}
+
+
+
+#begin:attachment(encoding="text",name="",action="execute/acapella",type="parameters")
+if (__version__>=20)
+	provideinput("Choose Wavelength for pericentrin channel", "523", ver=2)
+	provideinput("Minimum cilia area", "3", ver=2)
+	provideinput("Cilium to reference intensity ratio", "2.2", ver=2)
+	provideinput("Cilia search region", "9", ver=2)
+	provideinput("Centering radius", "5", ver=2)
+	provideinput("Output segmentation", "1", ver=2)
+	provideinput("Measure distances between nuclei and centrosomes", "0", ver=2)
+	provideinput("SpotMinimumDistance: Spot Detection", "20", ver=2)
+	provideinput("SpotPeakRadius: Spot Detection", "2", ver=2)
+	provideinput("SpotReferenceRadius: Spot Detection", "5", ver=2)
+	provideinput("SpotMinimumContrast: Spot Detection", "0.3", ver=2)
+	provideinput("SpotMinimumToCellIntensity: Spot Detection", "3", ver=2)
+	provideinput("Threshold Adjustment: Nuclei Detection", "2", ver=2)
+	provideinput("Minimum Nuclei Distance: Nuclei Detection", "7", ver=2)
+	provideinput("Nuclear Splitting Adjustment: Nuclei Detection", "7", ver=2)
+	provideinput("Individual Threshold Adjustment: Nuclei Detection", "0.5", ver=2)
+	provideinput("Minimum Nuclear Area: Nuclei Detection", "1000", ver=2)
+	provideinput("Minimum Nuclear Contrast: Nuclei Detection", "0.03", ver=2)
+	provideinput("Cytoplasm Individual Threshold Adjustment: Cytoplasm Detection", "0.15", ver=2)
+	provideinput("CytoplasmOuterBorderShift: Cytoplasm Region", "0", ver=2)
+	provideinput("CytoplasmInnerBorderShift: Cytoplasm Region", "0", ver=2)
+	provideinput("NucleusBorderShift: Cytoplasm Region", "oo", ver=2)
+else()
+	provideinput("Choose Wavelength for pericentrin channel", "523")
+	provideinput("Minimum cilia area", "3")
+	provideinput("Cilium to reference intensity ratio", "2.2")
+	provideinput("Cilia search region", "9")
+	provideinput("Centering radius", "5")
+	provideinput("Output segmentation", "1")
+	provideinput("Measure distances between nuclei and centrosomes", "0")
+	provideinput("SpotMinimumDistance: Spot Detection", "20")
+	provideinput("SpotPeakRadius: Spot Detection", "2")
+	provideinput("SpotReferenceRadius: Spot Detection", "5")
+	provideinput("SpotMinimumContrast: Spot Detection", "0.3")
+	provideinput("SpotMinimumToCellIntensity: Spot Detection", "3")
+	provideinput("Threshold Adjustment: Nuclei Detection", "2")
+	provideinput("Minimum Nuclei Distance: Nuclei Detection", "7")
+	provideinput("Nuclear Splitting Adjustment: Nuclei Detection", "7")
+	provideinput("Individual Threshold Adjustment: Nuclei Detection", "0.5")
+	provideinput("Minimum Nuclear Area: Nuclei Detection", "1000")
+	provideinput("Minimum Nuclear Contrast: Nuclei Detection", "0.03")
+	provideinput("Cytoplasm Individual Threshold Adjustment: Cytoplasm Detection", "0.15")
+	provideinput("CytoplasmOuterBorderShift: Cytoplasm Region", "0")
+	provideinput("CytoplasmInnerBorderShift: Cytoplasm Region", "0")
+	provideinput("NucleusBorderShift: Cytoplasm Region", "oo")
+end()
+
+#end:attachment
