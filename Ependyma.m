@@ -1,5 +1,9 @@
 %% Ependyma is the main function. Calculates angles of basal body orientation vectors (BBOV) (Figure 2)
 
+% 1. Create ROIs of cell outlines for every image
+% 2. Save ROIs as zip files (names have to correspond to tiff files)
+% 3. Run the script
+
 %% Additional functions used and included:
 % combinecsv - combines csv files from a folder into a single cell aray
 % cell2double - converts cell array of double into an array of doubles
@@ -23,7 +27,7 @@
 
 %% Ependyma
 function Ependyma(top_folder,varargin)
-% Ependymais - calculates angles of basal body orientation vectors (BBOV) 
+% Ependyma - calculates angles of basal body orientation vectors (BBOV) 
 % top_folder - top folder with subfolder containing annotated tiff files
 % bb_size_thresh - maximum allowed ratio of BB to cell area
 % all_data_sets - names of the data-sets
