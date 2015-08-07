@@ -1,2 +1,2 @@
 # PTEN-paper
-This repository contains a script for Acapella 2.6 (PerkinElmer) and MATLAB 2015a (MathWorks), used in Nature Communications publication "PTEN Regulates Cilia Through Dishevelled"
+This repository contains collection of code for Acapella 2.6 (PerkinElmer) and MATLAB 2015a (MathWorks), used in Nature Communications publication "PTEN Regulates Cilia Through Dishevelled"
